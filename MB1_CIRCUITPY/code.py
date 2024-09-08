@@ -94,7 +94,7 @@ if not button.value:  # Button is pressed (active LOW)
     time.sleep(1.0)
     microcontroller.on_next_reset(microcontroller.RunMode.BOOTLOADER)
     microcontroller.reset()
-    
+
 while True:
     current_button_state = button.value
     current_time = time.monotonic()
