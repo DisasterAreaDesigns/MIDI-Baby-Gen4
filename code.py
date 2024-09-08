@@ -13,9 +13,10 @@ import adafruit_midi
 from adafruit_midi.control_change import ControlChange
 from adafruit_midi.program_change import ProgramChange
 import busio
+import microcontroller
 
 
-# MIDI output:  UART0 at GP0     
+# MIDI output:  UART0 at GP0
 # RGB LED:  GP25    Footswitch: GP26
 # Jack Tip: GP28    Jack Ring:  GP29
 # I2C EEPROM:  Address 0x50, using I2C0 at GP2, GP3
@@ -26,7 +27,9 @@ import busio
 # Initialize the NeoPixel, 5MM "RGB" order instead of usual "GRB"
 pixel_pin = board.GP25
 num_pixels = 1
-pixels = neopixel.NeoPixel(pixel_pin, num_pixels, brightness=0.5, auto_write=False, pixel_order=(0, 1, 2))
+pixels = neopixel.NeoPixel(
+    pixel_pin, num_pixels, brightness=0.5, auto_write=False, pixel_order=(0, 1, 2)
+)
 
 # Initialize the button
 button = digitalio.DigitalInOut(board.GP26)
@@ -51,15 +54,18 @@ long_press_triggered = False
 # Color array for different programs
 colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 255)]
 
+
 def send_midi_message(message):
     usb_midi.send(message)
     serial_midi.send(message)
+
 
 def update_led():
     color = colors[current_program]
     pixels.brightness = led_brightness
     pixels.fill(color)
     pixels.show()
+
 
 # Startup sequence
 def startup_sequence():
@@ -68,17 +74,31 @@ def startup_sequence():
         pixels.fill(color)
         pixels.show()
         time.sleep(0.3)  # Show each color for 0.3 seconds
-    pixels.fill((0, 0, 0))  # Turn off the LED
+    pixels.fill(0)  # Turn off the LED
     pixels.show()
     time.sleep(0.3)  # Brief pause with LED off
+
 
 # Run the startup sequence
 startup_sequence()
 
+# Check if the button is held down after startup
+# this runs the hardware bootloader and lets us put the normal MIDI Baby firmware on without
+# needing a screwdriver!
+if not button.value:  # Button is pressed (active LOW)
+    # Button is held down, enter UF2 mode
+    color = (255, 0, 255)
+    pixels.fill(color)
+    pixels.show()
+    print("resetting now")
+    time.sleep(1.0)
+    microcontroller.on_next_reset(microcontroller.RunMode.BOOTLOADER)
+    microcontroller.reset()
+    
 while True:
     current_button_state = button.value
     current_time = time.monotonic()
-    
+
     if current_button_state != last_button_state:
         if not current_button_state:  # Button is pressed (remember, it's active LOW)
             button_press_time = current_time
@@ -88,11 +108,13 @@ while True:
                 current_program = (current_program + 1) % 4
                 send_midi_message(ProgramChange(current_program))
                 update_led()
-        
+
         last_button_state = current_button_state
 
     if not current_button_state:  # Button is still pressed
-        if not long_press_triggered and (current_time - button_press_time > 0.5):  # Long press detected
+        if not long_press_triggered and (
+            current_time - button_press_time > 0.5
+        ):  # Long press detected
             cc_value = 0 if cc_value == 127 else 127
             send_midi_message(ControlChange(102, cc_value))
             led_brightness = 0.05 if cc_value == 0 else 0.8
