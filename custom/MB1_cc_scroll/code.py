@@ -2,19 +2,30 @@
 #
 # Tap:      send the next CC in the range CC_FIRST..CC_LAST, value 1, on MIDI
 #           channel 1.  Wraps from CC 33 back to CC 10.
-# Hold 2s:  jump back to the first step and re-send CC 10 value 1.
+# Hold 2s:  jump back to the first step and re-send CC 10 value 1, then also
+#           send CC 4 value 3.  Both on channel 1.
 #
 # The tap message is sent on switch RELEASE so that a hold does not also fire
 # a scroll message on the way down.
 #
 # Hardware (MIDI Baby Gen4, one-switch version):
-#   MIDI output: UART0 TX on GP0, 31250 baud
-#   RGB LED:     GP25 (NeoPixel, "RGB" order, not the usual GRB)
 #   Footswitch:  GP26, active LOW with internal pull-up
-#   Jack tip:    GP28      Jack ring: GP29
-#   I2C EEPROM:  0x50 on I2C0 (GP2 SDA, GP3 SCL), 64 kbit / 4096 bytes
-#   USB host:    D+ GP6, D- GP7  (not supported by CircuitPython)
+#   RGB LED:     GP25 (NeoPixel, "RGB" order, not the usual GRB)
+#   MIDI out:    three destinations, every message goes to all of them --
+#                  1. USB MIDI
+#                  2. DIN jack, GP8, 31250 baud -- ordinary busio.UART
+#                     (UART1 TX; GP9 RX is not broken out)
+#                  3. multijack TIP, GP28 -- with the RING, GP29, held HIGH
+#                     as the TRS current source
+#
+# The multijack tip is silent unless the ring is driven HIGH first: the ring is
+# the TRS current source.  That, not the tip pin, is what makes the jack work.
+#
+# GP28 is UART0 TX and could be a second busio.UART, but PIO is what is proven
+# on this hardware and it mirrors the stock firmware's split -- HardwareSerial
+# for the DIN jack, SerialPIO for the multijack.
 
+import array
 import board
 import neopixel
 import digitalio
@@ -23,6 +34,7 @@ import usb_midi
 import adafruit_midi
 from adafruit_midi.control_change import ControlChange
 import busio
+import rp2pio
 import microcontroller
 
 # ---------------------------------------------------------------- settings --
@@ -31,7 +43,10 @@ CC_LAST = 33  # last CC number in the scroll, then it wraps
 CC_VALUE = 1  # value sent with every CC
 MIDI_CHANNEL = 0  # 0 = MIDI channel 1
 HOLD_TIME = 2.0  # seconds to hold for "back to first step"
+HOLD_CC = 4  # extra CC sent on hold, after the reset CC
+HOLD_CC_VALUE = 3  # value for that extra CC
 BRIGHTNESS = 0.5
+BAUD = 31250
 
 NUM_STEPS = CC_LAST - CC_FIRST + 1
 
@@ -45,12 +60,64 @@ button = digitalio.DigitalInOut(board.GP26)
 button.direction = digitalio.Direction.INPUT
 button.pull = digitalio.Pull.UP
 
-# Initialize UART for serial MIDI
-uart = busio.UART(tx=board.GP0, baudrate=31250)
 
-# Initialize USB MIDI and serial MIDI
+class PIOSerialTX:
+    """Transmit-only UART on any GPIO, using one PIO state machine.
+
+    Used for the multijack tip only; the DIN jack uses busio.UART.
+
+    The whole program is a single instruction,
+
+        out pins, 1 [7]        ; = 0x6701
+
+    so each bit takes 8 PIO clocks and the state machine runs at 8x the baud
+    rate.  write() pre-packs each byte into a 10-bit frame: bit 0 low is the
+    start bit, bits 1-8 are the data LSB first, bit 9 high is the stop bit.
+    auto_pull refills the OSR every 10 bits, and when the FIFO runs dry the
+    state machine stalls with the last bit -- the stop bit -- still on the pin,
+    so the line idles high the way MIDI expects.
+    """
+
+    _PROGRAM = array.array("H", [0x6701])
+
+    def __init__(self, pin, baudrate):
+        self._sm = rp2pio.StateMachine(
+            self._PROGRAM,
+            frequency=baudrate * 8,
+            first_out_pin=pin,
+            out_pin_count=1,
+            initial_out_pin_state=1,
+            initial_out_pin_direction=1,
+            auto_pull=True,
+            pull_threshold=10,
+            out_shift_right=True,
+        )
+
+    def write(self, data):
+        self._sm.write(array.array("L", [(b << 1) | 0x200 for b in data]))
+
+
+# Multijack ring: held high, it is the TRS MIDI current source for the tip.
+# This has to come up before the tip starts transmitting.
+#
+# The raspberry_pi_pico build does not export GP29 under that name -- on a
+# stock Pico that pin is the VSYS voltage divider, so it is only reachable as
+# board.VOLTAGE_MONITOR.  Other builds do have board.GP29.
+RING_PIN = board.GP29 if hasattr(board, "GP29") else board.VOLTAGE_MONITOR
+
+ring = digitalio.DigitalInOut(RING_PIN)
+ring.direction = digitalio.Direction.OUTPUT
+ring.value = True
+
+tip = PIOSerialTX(board.GP28, BAUD)  # multijack tip
+
+# DIN jack: ordinary hardware UART (UART1 TX).
+uart = busio.UART(tx=board.GP8, baudrate=BAUD)
+
+# Initialize USB and DIN MIDI.  The multijack tip is fed raw bytes instead,
+# since PIOSerialTX is not an adafruit_midi output object.
 usb_midi = adafruit_midi.MIDI(midi_out=usb_midi.ports[1], out_channel=MIDI_CHANNEL)
-serial_midi = adafruit_midi.MIDI(midi_out=uart, out_channel=MIDI_CHANNEL)
+din_midi = adafruit_midi.MIDI(midi_out=uart, out_channel=MIDI_CHANNEL)
 
 # Initialize state variables
 step = None  # None until the first tap, then 0..NUM_STEPS-1
@@ -59,10 +126,11 @@ button_press_time = 0
 hold_triggered = False
 
 
-def send_cc(number):
-    message = ControlChange(number, CC_VALUE)
+def send_cc(number, value=CC_VALUE):
+    message = ControlChange(number, value)
     usb_midi.send(message)
-    serial_midi.send(message)
+    din_midi.send(message)
+    tip.write(bytes((0xB0 | MIDI_CHANNEL, number, value)))
 
 
 def wheel(pos):
@@ -133,8 +201,9 @@ while True:
 
     if not current_button_state:  # Button is still pressed
         if not hold_triggered and (current_time - button_press_time > HOLD_TIME):
-            # Long press: back to the first step and re-send it
+            # Long press: back to the first step, re-send it, then the extra CC
             scroll_to(0)
+            send_cc(HOLD_CC, HOLD_CC_VALUE)
             pixels.fill((255, 255, 255))  # flash white to confirm the reset
             pixels.show()
             time.sleep(0.15)
